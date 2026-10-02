@@ -2,6 +2,6 @@
   "name": "pingless-bot",
   "main": "bot.js",
   "dependencies": {
-    "playwright": "1.33.8"
+    "playwright": "1.63.0"
   }
 }   
