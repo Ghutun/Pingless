@@ -14,7 +14,8 @@ function log(msg) {
 const server = http.createServer((q, s) => s.end('alive'));
 server.listen(PORT, () => log(`[SERVER] listening on ${PORT}`));
 
-let browser, context;
+let browser, context, afkPage;
+let lastCredits = -1;
 
 async function initBrowser() {
   log('[BROWSER] Launching...');
@@ -39,25 +40,85 @@ async function blockAds(page) {
   });
 }
 
-// --- AFK: persistent tab ---
-let afkPage;
+async function getPageState(page) {
+  return await page.evaluate(() => {
+    return {
+      title: document.title,
+      text: document.body.innerText.slice(0, 3000)
+    };
+  });
+}
 
+function parseCredits(text) {
+  const match = text.match(/([\d.]+)\s*credits?/i);
+  return match ? parseFloat(match[1]) : -1;
+}
+
+function logCoinChange(current) {
+  if (lastCredits >= 0 && current >= 0) {
+    const diff = current - lastCredits;
+    if (Math.abs(diff) >= 50) {
+      log(`[COINS] ${lastCredits.toFixed(2)} → ${current.toFixed(2)} (${diff >= 0 ? '+' : ''}${diff.toFixed(2)})`);
+    }
+  }
+  lastCredits = current;
+}
+
+function parseRewardCooldown(text) {
+  const timerMatch = text.match(/(\d{1,2}:\d{2}:\d{2})/);
+  const claimReady = /reward.*?:\s*\d+\s*credits?/i.test(text) && !timerMatch;
+  return { ready: claimReady, timer: timerMatch ? timerMatch[1] : null };
+}
+
+function parseServerExpiry(text) {
+  const expired = /expired/i.test(text);
+
+  // Try "Xh Ym" or "Xh" or "Xm" or "XX:XX:XX"
+  let minutesLeft = null;
+
+  const hMinMatch = text.match(/expires?\s+in\s+(\d+)h\s*(\d+)?m?/i);
+  if (hMinMatch) {
+    const h = parseInt(hMinMatch[1]);
+    const m = hMinMatch[2] ? parseInt(hMinMatch[2]) : 0;
+    minutesLeft = h * 60 + m;
+  }
+
+  const minOnlyMatch = text.match(/expires?\s+in\s+(\d+)m/i);
+  if (minOnlyMatch && minutesLeft === null) {
+    minutesLeft = parseInt(minOnlyMatch[1]);
+  }
+
+  const timerMatch = text.match(/(\d{1,2}):(\d{2}):(\d{2})/);
+  if (timerMatch && minutesLeft === null) {
+    const h = parseInt(timerMatch[1]);
+    const m = parseInt(timerMatch[2]);
+    minutesLeft = h * 60 + m;
+  }
+
+  return { expired, minutesLeft };
+}
+
+// --- AFK ---
 async function startAFK() {
-  log('[AFK] Opening /afk...');
+  log('[AFK] Starting...');
   afkPage = await context.newPage();
   await blockAds(afkPage);
+
   const resp = await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
   log(`[AFK] Status: ${resp ? resp.status() : 'none'}`);
   await afkPage.waitForTimeout(5000);
 
-  const title = await afkPage.title().catch(() => 'unknown');
-  log(`[AFK] Title: "${title}"`);
+  const state = await getPageState(afkPage);
+  log(`[AFK] Title: "${state.title}"`);
 
-  if (title.includes('Login')) {
+  if (state.title.includes('Login') || state.text.includes('Sign in')) {
     log('[AFK] ❌ NOT LOGGED IN');
     return false;
   }
 
+  const credits = parseCredits(state.text);
+  log(`[AFK] Credits: ${credits}`);
+  lastCredits = credits;
   log('[AFK] ✅ Running 24/7');
 
   setInterval(async () => {
@@ -69,6 +130,7 @@ async function startAFK() {
         log('[AFK] Redirected, going back...');
         await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await afkPage.waitForTimeout(3000);
+        log('[AFK] ✅ Back');
       }
     } catch (e) {
       log(`[AFK] Page died, reloading...`);
@@ -84,32 +146,36 @@ async function startAFK() {
   return true;
 }
 
-// --- Claim reward (uses same browser, new tab) ---
-async function claimReward() {
-  log('[REWARD] Starting...');
+// --- Smart reward ---
+async function checkReward() {
+  log('[REWARD] Checking...');
   const page = await context.newPage();
   await blockAds(page);
   try {
-    const resp = await page.goto(`https://${HOST}/dashboard`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    log(`[REWARD] Status: ${resp ? resp.status() : 'none'}`);
+    await page.goto(`https://${HOST}/dashboard`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(5000);
 
-    const title = await page.title().catch(() => 'unknown');
-    log(`[REWARD] Title: "${title}"`);
-
-    if (title.includes('Login')) {
+    const state = await getPageState(page);
+    if (state.title.includes('Login')) {
       log('[REWARD] ❌ NOT LOGGED IN');
       return;
     }
 
-    // Try multiple selectors
+    const credits = parseCredits(state.text);
+    logCoinChange(credits);
+
+    const { ready, timer } = parseRewardCooldown(state.text);
+    log(`[REWARD] Ready: ${ready}, Timer: ${timer || 'none'}`);
+
+    if (!ready) {
+      log(`[REWARD] ⏳ Cooldown (${timer}), skipping`);
+      return;
+    }
+
     const selectors = [
+      'button:has-text("Reward")',
       'button:has-text("Claim")',
-      'button:has-text("claim")',
       'button:has-text("Collect")',
-      'button:has-text("collect")',
-      '[class*="claim"]',
-      '[class*="reward"] button',
       'button:has-text("150")',
     ];
 
@@ -117,18 +183,24 @@ async function claimReward() {
     for (const sel of selectors) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
-        log(`[REWARD] Found button: "${sel}"`);
+        const btnText = await btn.textContent().catch(() => '');
+        log(`[REWARD] Clicking: "${btnText.trim()}"`);
         await btn.click();
         await page.waitForTimeout(3000);
+
+        // Log coins after claim
+        const afterState = await getPageState(page);
+        const afterCredits = parseCredits(afterState.text);
+        if (afterCredits >= 0) {
+          log(`[COINS] ${lastCredits.toFixed(2)} → ${afterCredits.toFixed(2)} (+${(afterCredits - lastCredits).toFixed(2)})`);
+          lastCredits = afterCredits;
+        }
         log('[REWARD] ✅ Claimed');
         clicked = true;
         break;
       }
     }
-    if (!clicked) {
-      log('[REWARD] No claim button found (already claimed?)');
-      await page.screenshot({ path: '/tmp/reward.png' }).catch(() => {});
-    }
+    if (!clicked) log('[REWARD] No button found');
   } catch (e) {
     log(`[REWARD] ERROR: ${e.message}`);
   } finally {
@@ -136,50 +208,75 @@ async function claimReward() {
   }
 }
 
-// --- Renew (uses same browser, new tab) ---
-async function renewServer() {
-  log(`[RENEW] Starting...`);
+// --- Smart renewal (only when 30 min left or expired) ---
+async function checkRenewal() {
+  log('[RENEW] Checking...');
   const page = await context.newPage();
   await blockAds(page);
   try {
-    const url = `https://${HOST}/panel/${SERVER_ID}`;
-    log(`[RENEW] Opening ${url}`);
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    log(`[RENEW] Status: ${resp ? resp.status() : 'none'}`);
+    // Check credits first
+    await page.goto(`https://${HOST}/dashboard`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(5000);
 
-    const title = await page.title().catch(() => 'unknown');
-    log(`[RENEW] Title: "${title}"`);
-
-    if (title.includes('Login')) {
+    const dashState = await getPageState(page);
+    if (dashState.title.includes('Login')) {
       log('[RENEW] ❌ NOT LOGGED IN');
       return;
     }
-    if (title.includes('404')) {
+
+    const credits = parseCredits(dashState.text);
+    logCoinChange(credits);
+    log(`[RENEW] Credits: ${credits}`);
+
+    if (credits >= 0 && credits < 500) {
+      log(`[RENEW] ⏳ Not enough credits (${credits} < 500), skipping`);
+      return;
+    }
+
+    // Check server expiry
+    const panelUrl = `https://${HOST}/panel/${SERVER_ID}`;
+    await page.goto(panelUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(5000);
+
+    const panelState = await getPageState(page);
+    log(`[RENEW] Panel: "${panelState.title}"`);
+
+    if (panelState.title.includes('404')) {
       log('[RENEW] ❌ 404');
       return;
     }
+
+    const { expired, minutesLeft } = parseServerExpiry(panelState.text);
+    log(`[RENEW] Expired: ${expired}, Minutes left: ${minutesLeft}`);
+
+    // Only renew if expired OR 30 min or less remaining
+    const shouldRenew = expired || (minutesLeft !== null && minutesLeft <= 30);
+
+    if (!shouldRenew) {
+      log(`[RENEW] ⏳ Server active (${minutesLeft}m left), skipping`);
+      return;
+    }
+
+    log('[RENEW] ✅ Renewing now');
 
     const selectors = [
       'button:has-text("Renew")',
       'button:has-text("renew")',
       'button:has-text("Restore")',
-      'button:has-text("restore")',
       'button:has-text("Reactivate")',
       'a:has-text("Renew")',
-      'a:has-text("renew")',
     ];
 
     let clicked = false;
     for (const sel of selectors) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
-        log(`[RENEW] Found button: "${sel}"`);
+        const btnText = await btn.textContent().catch(() => '');
+        log(`[RENEW] Clicking: "${btnText.trim()}"`);
         await btn.click();
         await page.waitForTimeout(3000);
 
-        // Confirm dialog
-        const confSelectors = ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("renew")', 'button:has-text("Confirm")'];
+        const confSelectors = ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("OK")'];
         for (const cs of confSelectors) {
           const cb = page.locator(cs).last();
           if (await cb.isVisible().catch(() => false)) {
@@ -188,15 +285,20 @@ async function renewServer() {
             break;
           }
         }
-        log('[RENEW] ✅ Done');
+
+        // Log coins after renewal
+        const afterState = await getPageState(page);
+        const afterCredits = parseCredits(afterState.text);
+        if (afterCredits >= 0) {
+          log(`[COINS] ${lastCredits.toFixed(2)} → ${afterCredits.toFixed(2)} (${(afterCredits - lastCredits).toFixed(2)})`);
+          lastCredits = afterCredits;
+        }
+        log('[RENEW] ✅ Done (-500)');
         clicked = true;
         break;
       }
     }
-    if (!clicked) {
-      log('[RENEW] No renew button found');
-      await page.screenshot({ path: '/tmp/renew.png' }).catch(() => {});
-    }
+    if (!clicked) log('[RENEW] No renew button found');
   } catch (e) {
     log(`[RENEW] ERROR: ${e.message}`);
   } finally {
@@ -204,25 +306,31 @@ async function renewServer() {
   }
 }
 
-// --- START (sequential, like SkyCastle) ---
+// --- Main loop ---
+async function checkAll() {
+  log('--- CHECK ---');
+  try {
+    await checkReward();
+    await checkRenewal();
+  } catch (e) {
+    log(`[CHECK] Error: ${e.message}`);
+  }
+  log('--- END ---');
+}
+
 async function main() {
-  log('[START] Pingless bot v6');
+  log('[START] Pingless bot v8');
   await initBrowser();
 
   const afkOk = await startAFK();
   if (!afkOk) {
-    log('[START] ❌ Failed to login, retrying in 5 min...');
+    log('[START] ❌ Login failed, retrying in 5 min...');
     setTimeout(main, 5 * 60 * 1000);
     return;
   }
 
-  await claimReward();
-  await renewServer();
-
-  log('[START] ✅ All tasks complete, running on schedule');
-
-  setInterval(claimReward, 24 * 60 * 60 * 1000);
-  setInterval(renewServer, 48 * 60 * 60 * 1000);
+  await checkAll();
+  setInterval(checkAll, 30 * 60 * 1000);
 }
 
 main();
