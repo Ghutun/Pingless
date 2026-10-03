@@ -7,27 +7,22 @@ const SID = 's%3AaQiZM6asrmiAcuxbtOaRTJA4WW7mU4R1.j6CRk%2B9fHfCXRCaZBqRz8dFMHrGG
 const USER_ID = '342814841943228420';
 const HOST = 'dash.pingless.org';
 
-let nextRenew = Date.now() + 48 * 60 * 60 * 1000;
-
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
-}
-
-function logRenewCountdown() {
-  const hoursLeft = ((nextRenew - Date.now()) / (60 * 60 * 1000)).toFixed(1);
-  log(`[RENEW] Next renewal in ${hoursLeft}h`);
 }
 
 const server = http.createServer((q, s) => s.end('alive'));
 server.listen(PORT, () => log(`[SERVER] listening on ${PORT}`));
 
-async function getBrowser() {
+let browser, context;
+
+async function initBrowser() {
   log('[BROWSER] Launching...');
-  const browser = await chromium.launch({
+  browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage']
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
   });
-  const context = await browser.newContext({
+  context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
   });
   await context.addCookies([
@@ -35,84 +30,66 @@ async function getBrowser() {
     { name: 'userId', value: USER_ID, domain: HOST, path: '/', secure: true }
   ]);
   log('[BROWSER] Ready');
-  return { browser, context };
 }
+
+async function blockAds(page) {
+  await page.route('**/*', (route) => {
+    if (route.request().url().includes('pingless.org')) route.continue();
+    else route.abort();
+  });
+}
+
+// --- AFK: persistent tab ---
+let afkPage;
 
 async function startAFK() {
-  log('[AFK] Starting...');
-  let browser;
-  try {
-    ({ browser } = await getBrowser());
-    const context = browser.contexts()[0];
-    const page = await context.newPage();
+  log('[AFK] Opening /afk...');
+  afkPage = await context.newPage();
+  await blockAds(afkPage);
+  const resp = await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  log(`[AFK] Status: ${resp ? resp.status() : 'none'}`);
+  await afkPage.waitForTimeout(5000);
 
-    await page.route('**/*', (route) => {
-      const url = route.request().url();
-      if (url.includes('pingless.org')) route.continue();
-      else route.abort();
-    });
+  const title = await afkPage.title().catch(() => 'unknown');
+  log(`[AFK] Title: "${title}"`);
 
-    log('[AFK] Opening /afk...');
-    const resp = await page.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    log(`[AFK] Status: ${resp ? resp.status() : 'none'}`);
-    await page.waitForTimeout(5000);
-
-    const title = await page.title().catch(() => 'unknown');
-    log(`[AFK] Title: "${title}"`);
-
-    if (title.includes('Login')) {
-      log('[AFK] ❌ NOT LOGGED IN - cookie expired');
-      await browser.close();
-      return;
-    }
-
-    log('[AFK] ✅ Connected, staying open 24/7');
-
-    setInterval(async () => {
-      try {
-        await page.evaluate(() => {
-          document.dispatchEvent(new MouseEvent('mousemove', { clientX: Math.random() * 500, clientY: Math.random() * 500 }));
-        });
-        const currentUrl = page.url();
-        if (!currentUrl.includes('/afk')) {
-          log(`[AFK] Redirected, going back...`);
-          await page.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await page.waitForTimeout(3000);
-          log('[AFK] ✅ Back on /afk');
-        }
-      } catch (e) {
-        log(`[AFK] Page died, reloading...`);
-        try {
-          await page.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-          await page.waitForTimeout(5000);
-          log('[AFK] ✅ Recovered');
-        } catch (e2) {
-          log(`[AFK] Reload failed: ${e2.message}`);
-        }
-      }
-    }, 30000);
-
-  } catch (e) {
-    log(`[AFK] ERROR: ${e.message}`);
-    if (browser) await browser.close().catch(() => {});
-    setTimeout(startAFK, 5 * 60 * 1000);
+  if (title.includes('Login')) {
+    log('[AFK] ❌ NOT LOGGED IN');
+    return false;
   }
+
+  log('[AFK] ✅ Running 24/7');
+
+  setInterval(async () => {
+    try {
+      await afkPage.evaluate(() => {
+        document.dispatchEvent(new MouseEvent('mousemove', { clientX: Math.random() * 500, clientY: Math.random() * 500 }));
+      });
+      if (!afkPage.url().includes('/afk')) {
+        log('[AFK] Redirected, going back...');
+        await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await afkPage.waitForTimeout(3000);
+      }
+    } catch (e) {
+      log(`[AFK] Page died, reloading...`);
+      try {
+        await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await afkPage.waitForTimeout(5000);
+        log('[AFK] ✅ Recovered');
+      } catch (e2) {
+        log(`[AFK] Reload failed: ${e2.message}`);
+      }
+    }
+  }, 30000);
+  return true;
 }
 
+// --- Claim reward (uses same browser, new tab) ---
 async function claimReward() {
   log('[REWARD] Starting...');
-  let browser;
+  const page = await context.newPage();
+  await blockAds(page);
   try {
-    ({ browser } = await getBrowser());
-    const context = browser.contexts()[0];
-    const page = await context.newPage();
-
-    await page.route('**/*', (route) => {
-      const url = route.request().url();
-      if (url.includes('pingless.org')) route.continue();
-      else route.abort();
-    });
-
     const resp = await page.goto(`https://${HOST}/dashboard`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     log(`[REWARD] Status: ${resp ? resp.status() : 'none'}`);
     await page.waitForTimeout(5000);
@@ -125,38 +102,46 @@ async function claimReward() {
       return;
     }
 
-    const claimBtn = page.locator('button', { hasText: /claim/i }).first();
-    const visible = await claimBtn.isVisible().catch(() => false);
-    log(`[REWARD] Button visible: ${visible}`);
+    // Try multiple selectors
+    const selectors = [
+      'button:has-text("Claim")',
+      'button:has-text("claim")',
+      'button:has-text("Collect")',
+      'button:has-text("collect")',
+      '[class*="claim"]',
+      '[class*="reward"] button',
+      'button:has-text("150")',
+    ];
 
-    if (visible) {
-      await claimBtn.click();
-      await page.waitForTimeout(3000);
-      log('[REWARD] ✅ Claimed');
-    } else {
-      log('[REWARD] Not available right now');
+    let clicked = false;
+    for (const sel of selectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible().catch(() => false)) {
+        log(`[REWARD] Found button: "${sel}"`);
+        await btn.click();
+        await page.waitForTimeout(3000);
+        log('[REWARD] ✅ Claimed');
+        clicked = true;
+        break;
+      }
+    }
+    if (!clicked) {
+      log('[REWARD] No claim button found (already claimed?)');
+      await page.screenshot({ path: '/tmp/reward.png' }).catch(() => {});
     }
   } catch (e) {
     log(`[REWARD] ERROR: ${e.message}`);
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    await page.close();
   }
 }
 
+// --- Renew (uses same browser, new tab) ---
 async function renewServer() {
-  log(`[RENEW] Starting (server: ${SERVER_ID})...`);
-  let browser;
+  log(`[RENEW] Starting...`);
+  const page = await context.newPage();
+  await blockAds(page);
   try {
-    ({ browser } = await getBrowser());
-    const context = browser.contexts()[0];
-    const page = await context.newPage();
-
-    await page.route('**/*', (route) => {
-      const url = route.request().url();
-      if (url.includes('pingless.org')) route.continue();
-      else route.abort();
-    });
-
     const url = `https://${HOST}/panel/${SERVER_ID}`;
     log(`[RENEW] Opening ${url}`);
     const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -170,51 +155,80 @@ async function renewServer() {
       log('[RENEW] ❌ NOT LOGGED IN');
       return;
     }
-
-    if (title.includes('404') || title.includes('not found')) {
-      log('[RENEW] ❌ 404 - wrong URL');
+    if (title.includes('404')) {
+      log('[RENEW] ❌ 404');
       return;
     }
 
-    const renewBtn = page.locator('button, a', { hasText: /renew|restore|reactivate|revive/i }).first();
-    const visible = await renewBtn.isVisible().catch(() => false);
-    log(`[RENEW] Button visible: ${visible}`);
+    const selectors = [
+      'button:has-text("Renew")',
+      'button:has-text("renew")',
+      'button:has-text("Restore")',
+      'button:has-text("restore")',
+      'button:has-text("Reactivate")',
+      'a:has-text("Renew")',
+      'a:has-text("renew")',
+    ];
 
-    if (visible) {
-      await renewBtn.click();
-      await page.waitForTimeout(3000);
-      const confirmBtn = page.locator('button', { hasText: /confirm|yes|renew|restore/i }).last();
-      const confVis = await confirmBtn.isVisible().catch(() => false);
-      if (confVis) {
-        await confirmBtn.click();
+    let clicked = false;
+    for (const sel of selectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible().catch(() => false)) {
+        log(`[RENEW] Found button: "${sel}"`);
+        await btn.click();
         await page.waitForTimeout(3000);
+
+        // Confirm dialog
+        const confSelectors = ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("renew")', 'button:has-text("Confirm")'];
+        for (const cs of confSelectors) {
+          const cb = page.locator(cs).last();
+          if (await cb.isVisible().catch(() => false)) {
+            await cb.click();
+            await page.waitForTimeout(3000);
+            break;
+          }
+        }
+        log('[RENEW] ✅ Done');
+        clicked = true;
+        break;
       }
-      log('[RENEW] ✅ Done');
-      nextRenew = Date.now() + 48 * 60 * 60 * 1000;
-      logRenewCountdown();
-    } else {
-      log('[RENEW] No renew button found (already renewed?)');
+    }
+    if (!clicked) {
+      log('[RENEW] No renew button found');
+      await page.screenshot({ path: '/tmp/renew.png' }).catch(() => {});
     }
   } catch (e) {
     log(`[RENEW] ERROR: ${e.message}`);
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    await page.close();
   }
 }
 
-// --- START ---
-log('[START] Pingless bot v6');
-log(`[START] Server: ${SERVER_ID}`);
-logRenewCountdown();
+// --- START (sequential, like SkyCastle) ---
+async function main() {
+  log('[START] Pingless bot v6');
+  await initBrowser();
 
-startAFK();
-claimReward();
+  const afkOk = await startAFK();
+  if (!afkOk) {
+    log('[START] ❌ Failed to login, retrying in 5 min...');
+    setTimeout(main, 5 * 60 * 1000);
+    return;
+  }
 
-setInterval(claimReward, 24 * 60 * 60 * 1000);
-setInterval(renewServer, 48 * 60 * 60 * 1000);
-setInterval(logRenewCountdown, 6 * 60 * 60 * 1000);
+  await claimReward();
+  await renewServer();
+
+  log('[START] ✅ All tasks complete, running on schedule');
+
+  setInterval(claimReward, 24 * 60 * 60 * 1000);
+  setInterval(renewServer, 48 * 60 * 60 * 1000);
+}
+
+main();
 
 process.on('SIGTERM', () => {
   log('SIGTERM');
+  if (browser) browser.close().catch(() => {});
   server.close(() => process.exit(0));
 });   
