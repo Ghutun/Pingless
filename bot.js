@@ -93,7 +93,7 @@ async function blockAds(page) {
 async function getPageState(page) {
   return await page.evaluate(() => ({
     title: document.title,
-    text: document.body?.innerText?.slice(0, 6000) || '',
+    text: document.body?.innerText?.slice(0, 8000) || '',
     url: location.href
   }));
 }
@@ -116,7 +116,7 @@ function parseCredits(text) {
 function logCoinChange(current) {
   if (lastCredits >= 0 && current >= 0) {
     const diff = current - lastCredits;
-    if (Math.abs(diff) >= 0.5) {
+    if (Math.abs(diff) >= 0.4) {
       log(`[COINS] ${lastCredits.toFixed(2)} → ${current.toFixed(2)} (${diff >= 0 ? '+' : ''}${diff.toFixed(2)})`);
     }
   }
@@ -124,16 +124,25 @@ function logCoinChange(current) {
 }
 
 function parseRewardInfo(text) {
-  const hasAvailableText = /your daily reward is available/i.test(text) ||
-                           /daily reward is available/i.test(text);
+  // More accurate detection
+  const available = /your daily reward is available/i.test(text) ||
+                    /daily reward is available/i.test(text);
 
-  const nextClaimMatch = text.match(/next claim in\s*(\d{1,2}:\d{2}:\d{2})/i) ||
-                         text.match(/claim in\s*(\d{1,2}:\d{2}:\d{2})/i);
+  // Specifically look for "Next claim in XX:XX:XX"
+  let timer = null;
+  const nextClaim = text.match(/next claim in\s*(\d{1,2}:\d{2}:\d{2})/i);
+  if (nextClaim) {
+    timer = nextClaim[1];
+  } else {
+    // fallback
+    const anyTimer = text.match(/(\d{1,2}:\d{2}:\d{2})/);
+    if (anyTimer) timer = anyTimer[1];
+  }
 
   return {
-    available: hasAvailableText,
-    timer: nextClaimMatch ? nextClaimMatch[1] : null,
-    ready: hasAvailableText && !nextClaimMatch
+    available,
+    timer,
+    ready: available && !timer
   };
 }
 
@@ -160,17 +169,37 @@ function parseServerExpiry(text) {
 }
 
 function parseAFKPage(text) {
-  const connected = /connection status.*?connected/i.test(text) || /connected/i.test(text);
+  const connected = /connected/i.test(text);
+
+  // Earning rate
+  let earningRate = null;
   const rateMatch = text.match(/([\d.]+)\s*credits?\/min/i);
-  const earningRate = rateMatch ? parseFloat(rateMatch[1]) : null;
+  if (rateMatch) earningRate = parseFloat(rateMatch[1]);
 
-  const nextRewardMatch = text.match(/next reward.*?(\d+)\s*s/i);
-  const nextRewardSec = nextRewardMatch ? parseInt(nextRewardMatch[1]) : null;
+  // Next reward seconds (multiple patterns)
+  let nextRewardSec = null;
+  const nextPatterns = [
+    /next reward.*?(\d+)\s*s/i,
+    /(\d+)\s*s/,
+    /next.*?(\d+)\s*sec/i
+  ];
+  for (const p of nextPatterns) {
+    const m = text.match(p);
+    if (m) {
+      nextRewardSec = parseInt(m[1]);
+      break;
+    }
+  }
 
-  const sessionEarnedMatch = text.match(/earned.*?([+\-]?[\d.]+)\s*credits?/i);
-  const sessionEarned = sessionEarnedMatch ? parseFloat(sessionEarnedMatch[1]) : 0;
+  // Session earned
+  let sessionEarned = 0;
+  const earnedMatch = text.match(/earned.*?([+\-]?[\d.]+)\s*credits?/i) ||
+                      text.match(/\+([\d.]+)\s*credits?/i);
+  if (earnedMatch) {
+    sessionEarned = parseFloat(earnedMatch[1]);
+  }
 
-  const partyBoost = /party boost active/i.test(text) || /x1\.\d+/i.test(text);
+  const partyBoost = /party boost/i.test(text) || /x1\.\d+/i.test(text);
 
   return { connected, earningRate, nextRewardSec, sessionEarned, partyBoost };
 }
@@ -224,27 +253,27 @@ async function startAFK() {
         return;
       }
 
-      // Activity simulation
+      // Activity
       await afkPage.evaluate(() => {
         document.dispatchEvent(new MouseEvent('mousemove', {
           clientX: Math.random() * window.innerWidth,
           clientY: Math.random() * window.innerHeight,
           bubbles: true
         }));
-        window.scrollBy(0, (Math.random() - 0.5) * 50);
+        window.scrollBy(0, (Math.random() - 0.5) * 40);
       });
 
       const state = await getPageState(afkPage);
       const info = parseAFKPage(state.text);
 
-      // Calculate earned since last check
+      // Calculate earned this round
       let earnedThisRound = 0;
       if (info.sessionEarned > lastSessionEarned) {
-        earnedThisRound = info.sessionEarned - lastSessionEarned;
+        earnedThisRound = +(info.sessionEarned - lastSessionEarned).toFixed(2);
       }
       lastSessionEarned = info.sessionEarned;
 
-      // Build log line
+      // Build clean log
       let status = `[AFK] `;
       status += info.connected ? 'Connected' : '⚠ Disconnected';
       if (info.earningRate) status += ` | ${info.earningRate} c/min`;
@@ -252,7 +281,7 @@ async function startAFK() {
       if (info.nextRewardSec !== null) status += ` | Next: ${info.nextRewardSec}s`;
       status += ` | Session: +${info.sessionEarned.toFixed(2)}`;
       if (earnedThisRound > 0) {
-        status += ` | +${earnedThisRound.toFixed(2)}`;
+        status += ` | +${earnedThisRound}`;
       }
 
       log(status);
@@ -312,7 +341,6 @@ async function checkReward() {
       'button:has-text("Get Reward")'
     ];
 
-    let clicked = false;
     for (const sel of selectors) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
@@ -326,12 +354,9 @@ async function checkReward() {
         if (afterCredits >= 0) logCoinChange(afterCredits);
 
         log('[REWARD] ✅ Claimed successfully');
-        clicked = true;
         break;
       }
     }
-
-    if (!clicked) log('[REWARD] ⚠ No claim button found');
 
   } catch (e) {
     log(`[REWARD] ERROR: ${e.message}`);
@@ -438,7 +463,7 @@ async function checkAll() {
 }
 
 async function main() {
-  log('[START] Pingless bot v11');
+  log('[START] Pingless bot v12');
   await initBrowser();
 
   const ok = await startAFK();
