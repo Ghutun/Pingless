@@ -17,36 +17,92 @@ server.listen(PORT, () => log(`[SERVER] listening on ${PORT}`));
 let browser, context, afkPage;
 let lastCredits = -1;
 
+// ==================== BROWSER ====================
 async function initBrowser() {
   log('[BROWSER] Launching...');
   browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled'
+    ]
   });
+
   context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 720 }
   });
+
+  // Hide webdriver
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+
   await context.addCookies([
     { name: 'pingless.sid', value: SID, domain: HOST, path: '/', secure: true, httpOnly: true },
     { name: 'userId', value: USER_ID, domain: HOST, path: '/', secure: true }
   ]);
+
   log('[BROWSER] Ready');
 }
 
+// ==================== SMART AD BLOCKER ====================
 async function blockAds(page) {
-  await page.route('**/*', (route) => {
-    if (route.request().url().includes('pingless.org')) route.continue();
-    else route.abort();
+  await page.route('**/*', async (route) => {
+    const request = route.request();
+    const url = request.url().toLowerCase();
+    const isNavigation = request.isNavigationRequest();
+    const isMainFrame = request.frame() === page.mainFrame();
+
+    // Allow main site
+    if (url.includes('pingless.org')) {
+      return route.continue();
+    }
+
+    // Allow Cloudflare (critical)
+    if (
+      url.includes('cloudflare.com') ||
+      url.includes('cdn-cgi') ||
+      url.includes('challenges.cloudflare.com') ||
+      url.includes('cloudflareinsights.com')
+    ) {
+      return route.continue();
+    }
+
+    // BLOCK any navigation away from the site (this stops AFK → ad redirect)
+    if (isNavigation && isMainFrame) {
+      log(`[BLOCK] Blocked navigation → ${url}`);
+      return route.abort();
+    }
+
+    // Block everything else
+    return route.abort();
+  });
+
+  // Extra safety net
+  page.on('framenavigated', async (frame) => {
+    if (frame !== page.mainFrame()) return;
+    const url = frame.url();
+    if (!url.includes('pingless.org')) {
+      log(`[AFK] Left site → ${url}. Forcing back to /afk`);
+      try {
+        await page.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (e) {
+        log(`[AFK] Force back failed: ${e.message}`);
+      }
+    }
   });
 }
 
+// ==================== HELPERS ====================
 async function getPageState(page) {
-  return await page.evaluate(() => {
-    return {
-      title: document.title,
-      text: document.body.innerText.slice(0, 3000)
-    };
-  });
+  return await page.evaluate(() => ({
+    title: document.title,
+    text: document.body?.innerText?.slice(0, 4000) || '',
+    url: location.href
+  }));
 }
 
 function parseCredits(text) {
@@ -57,7 +113,7 @@ function parseCredits(text) {
 function logCoinChange(current) {
   if (lastCredits >= 0 && current >= 0) {
     const diff = current - lastCredits;
-    if (Math.abs(diff) >= 50) {
+    if (Math.abs(diff) >= 1) {
       log(`[COINS] ${lastCredits.toFixed(2)} → ${current.toFixed(2)} (${diff >= 0 ? '+' : ''}${diff.toFixed(2)})`);
     }
   }
@@ -72,8 +128,6 @@ function parseRewardCooldown(text) {
 
 function parseServerExpiry(text) {
   const expired = /expired/i.test(text);
-
-  // Try "Xh Ym" or "Xh" or "Xm" or "XX:XX:XX"
   let minutesLeft = null;
 
   const hMinMatch = text.match(/expires?\s+in\s+(\d+)h\s*(\d+)?m?/i);
@@ -90,26 +144,27 @@ function parseServerExpiry(text) {
 
   const timerMatch = text.match(/(\d{1,2}):(\d{2}):(\d{2})/);
   if (timerMatch && minutesLeft === null) {
-    const h = parseInt(timerMatch[1]);
-    const m = parseInt(timerMatch[2]);
-    minutesLeft = h * 60 + m;
+    minutesLeft = parseInt(timerMatch[1]) * 60 + parseInt(timerMatch[2]);
   }
 
   return { expired, minutesLeft };
 }
 
-// --- AFK ---
+// ==================== AFK ====================
 async function startAFK() {
   log('[AFK] Starting...');
   afkPage = await context.newPage();
   await blockAds(afkPage);
 
-  const resp = await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  const resp = await afkPage.goto(`https://${HOST}/afk`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 45000
+  });
   log(`[AFK] Status: ${resp ? resp.status() : 'none'}`);
   await afkPage.waitForTimeout(5000);
 
   const state = await getPageState(afkPage);
-  log(`[AFK] Title: "${state.title}"`);
+  log(`[AFK] Title: "${state.title}" | URL: ${state.url}`);
 
   if (state.title.includes('Login') || state.text.includes('Sign in')) {
     log('[AFK] ❌ NOT LOGGED IN');
@@ -121,36 +176,72 @@ async function startAFK() {
   lastCredits = credits;
   log('[AFK] ✅ Running 24/7');
 
+  // Strong keep-alive
   setInterval(async () => {
     try {
-      await afkPage.evaluate(() => {
-        document.dispatchEvent(new MouseEvent('mousemove', { clientX: Math.random() * 500, clientY: Math.random() * 500 }));
-      });
-      if (!afkPage.url().includes('/afk')) {
-        log('[AFK] Redirected, going back...');
-        await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await afkPage.waitForTimeout(3000);
-        log('[AFK] ✅ Back');
+      if (afkPage.isClosed()) {
+        log('[AFK] Page closed, recreating...');
+        await startAFK();
+        return;
       }
+
+      const currentUrl = afkPage.url();
+      const title = await afkPage.title().catch(() => 'unknown');
+
+      // Detect bad states
+      if (
+        title.toLowerCase().includes('just a moment') ||
+        title.toLowerCase().includes('verify') ||
+        title.toLowerCase().includes('cloudflare') ||
+        title.toLowerCase().includes('login') ||
+        !currentUrl.includes('/afk')
+      ) {
+        log(`[AFK] Bad state → Title: "${title}" | URL: ${currentUrl}`);
+        log('[AFK] Reloading /afk...');
+        await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await afkPage.waitForTimeout(4000);
+        return;
+      }
+
+      // Activity simulation
+      await afkPage.evaluate(() => {
+        document.dispatchEvent(new MouseEvent('mousemove', {
+          clientX: Math.random() * window.innerWidth,
+          clientY: Math.random() * window.innerHeight,
+          bubbles: true
+        }));
+        window.scrollBy(0, (Math.random() - 0.5) * 80);
+      });
+
+      // Log credits from AFK page
+      const state = await getPageState(afkPage);
+      const credits = parseCredits(state.text);
+      if (credits >= 0) {
+        log(`[AFK] Alive | Credits: ${credits.toFixed(2)}`);
+        logCoinChange(credits);
+      }
+
     } catch (e) {
-      log(`[AFK] Page died, reloading...`);
+      log(`[AFK] Keep-alive error: ${e.message}`);
       try {
         await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await afkPage.waitForTimeout(5000);
-        log('[AFK] ✅ Recovered');
+        log('[AFK] Recovered');
       } catch (e2) {
-        log(`[AFK] Reload failed: ${e2.message}`);
+        log(`[AFK] Recovery failed: ${e2.message}`);
       }
     }
-  }, 30000);
+  }, 45 * 1000);
+
   return true;
 }
 
-// --- Smart reward ---
+// ==================== REWARD ====================
 async function checkReward() {
   log('[REWARD] Checking...');
   const page = await context.newPage();
   await blockAds(page);
+
   try {
     await page.goto(`https://${HOST}/dashboard`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(5000);
@@ -177,6 +268,7 @@ async function checkReward() {
       'button:has-text("Claim")',
       'button:has-text("Collect")',
       'button:has-text("150")',
+      'button:has-text("Daily")'
     ];
 
     let clicked = false;
@@ -188,7 +280,6 @@ async function checkReward() {
         await btn.click();
         await page.waitForTimeout(3000);
 
-        // Log coins after claim
         const afterState = await getPageState(page);
         const afterCredits = parseCredits(afterState.text);
         if (afterCredits >= 0) {
@@ -208,13 +299,14 @@ async function checkReward() {
   }
 }
 
-// --- Smart renewal (only when 30 min left or expired) ---
+// ==================== RENEWAL ====================
 async function checkRenewal() {
   log('[RENEW] Checking...');
   const page = await context.newPage();
   await blockAds(page);
+
   try {
-    // Check credits first
+    // 1. Check credits
     await page.goto(`https://${HOST}/dashboard`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(5000);
 
@@ -233,7 +325,7 @@ async function checkRenewal() {
       return;
     }
 
-    // Check server expiry
+    // 2. Check server expiry
     const panelUrl = `https://${HOST}/panel/${SERVER_ID}`;
     await page.goto(panelUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(5000);
@@ -249,9 +341,8 @@ async function checkRenewal() {
     const { expired, minutesLeft } = parseServerExpiry(panelState.text);
     log(`[RENEW] Expired: ${expired}, Minutes left: ${minutesLeft}`);
 
-    // Only renew if expired OR 30 min or less remaining
+    // Only renew if expired OR ≤ 30 minutes left
     const shouldRenew = expired || (minutesLeft !== null && minutesLeft <= 30);
-
     if (!shouldRenew) {
       log(`[RENEW] ⏳ Server active (${minutesLeft}m left), skipping`);
       return;
@@ -264,7 +355,7 @@ async function checkRenewal() {
       'button:has-text("renew")',
       'button:has-text("Restore")',
       'button:has-text("Reactivate")',
-      'a:has-text("Renew")',
+      'a:has-text("Renew")'
     ];
 
     let clicked = false;
@@ -276,6 +367,7 @@ async function checkRenewal() {
         await btn.click();
         await page.waitForTimeout(3000);
 
+        // Confirm dialog
         const confSelectors = ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("OK")'];
         for (const cs of confSelectors) {
           const cb = page.locator(cs).last();
@@ -286,7 +378,6 @@ async function checkRenewal() {
           }
         }
 
-        // Log coins after renewal
         const afterState = await getPageState(page);
         const afterCredits = parseCredits(afterState.text);
         if (afterCredits >= 0) {
@@ -306,7 +397,7 @@ async function checkRenewal() {
   }
 }
 
-// --- Main loop ---
+// ==================== MAIN LOOP ====================
 async function checkAll() {
   log('--- CHECK ---');
   try {
@@ -319,7 +410,7 @@ async function checkAll() {
 }
 
 async function main() {
-  log('[START] Pingless bot v8');
+  log('[START] Pingless bot v9 (smart AFK + adblock)');
   await initBrowser();
 
   const afkOk = await startAFK();
@@ -330,7 +421,7 @@ async function main() {
   }
 
   await checkAll();
-  setInterval(checkAll, 30 * 60 * 1000);
+  setInterval(checkAll, 30 * 60 * 1000); // every 30 min
 }
 
 main();
@@ -339,4 +430,4 @@ process.on('SIGTERM', () => {
   log('SIGTERM');
   if (browser) browser.close().catch(() => {});
   server.close(() => process.exit(0));
-});   
+});
