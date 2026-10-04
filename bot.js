@@ -16,6 +16,7 @@ server.listen(PORT, () => log(`[SERVER] listening on ${PORT}`));
 
 let browser, context, afkPage;
 let lastCredits = -1;
+let lastSessionEarned = 0;
 
 // ==================== BROWSER ====================
 async function initBrowser() {
@@ -66,7 +67,6 @@ async function blockAds(page) {
       return route.continue();
     }
 
-    // Block leaving the site (stops AFK → ad redirect)
     if (isNavigation && isMainFrame) {
       log(`[BLOCK] Blocked navigation → ${url}`);
       return route.abort();
@@ -93,18 +93,16 @@ async function blockAds(page) {
 async function getPageState(page) {
   return await page.evaluate(() => ({
     title: document.title,
-    text: document.body?.innerText?.slice(0, 5000) || '',
+    text: document.body?.innerText?.slice(0, 6000) || '',
     url: location.href
   }));
 }
 
 function parseCredits(text) {
-  // More accurate patterns
   const patterns = [
     /(?:balance|total|you have|credits?)[:\s]*([\d.]+)/i,
-    /([\d.]+)\s*credits?/i,
+    /([\d.]+)\s*credits?/i
   ];
-
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match) {
@@ -125,10 +123,18 @@ function logCoinChange(current) {
   if (current >= 0) lastCredits = current;
 }
 
-function parseRewardCooldown(text) {
-  const timerMatch = text.match(/(\d{1,2}:\d{2}:\d{2})/);
-  const claimReady = /reward.*?:\s*\d+\s*credits?/i.test(text) && !timerMatch;
-  return { ready: claimReady, timer: timerMatch ? timerMatch[1] : null };
+function parseRewardInfo(text) {
+  const hasAvailableText = /your daily reward is available/i.test(text) ||
+                           /daily reward is available/i.test(text);
+
+  const nextClaimMatch = text.match(/next claim in\s*(\d{1,2}:\d{2}:\d{2})/i) ||
+                         text.match(/claim in\s*(\d{1,2}:\d{2}:\d{2})/i);
+
+  return {
+    available: hasAvailableText,
+    timer: nextClaimMatch ? nextClaimMatch[1] : null,
+    ready: hasAvailableText && !nextClaimMatch
+  };
 }
 
 function parseServerExpiry(text) {
@@ -153,27 +159,20 @@ function parseServerExpiry(text) {
   return { expired, minutesLeft };
 }
 
-// ==================== AFK PAGE PARSER ====================
 function parseAFKPage(text) {
   const connected = /connection status.*?connected/i.test(text) || /connected/i.test(text);
   const rateMatch = text.match(/([\d.]+)\s*credits?\/min/i);
   const earningRate = rateMatch ? parseFloat(rateMatch[1]) : null;
 
-  const nextRewardMatch = text.match(/next reward.*?(\d+)\s*s/i) || text.match(/(\d+)\s*s/);
+  const nextRewardMatch = text.match(/next reward.*?(\d+)\s*s/i);
   const nextRewardSec = nextRewardMatch ? parseInt(nextRewardMatch[1]) : null;
 
   const sessionEarnedMatch = text.match(/earned.*?([+\-]?[\d.]+)\s*credits?/i);
-  const sessionEarned = sessionEarnedMatch ? parseFloat(sessionEarnedMatch[1]) : null;
+  const sessionEarned = sessionEarnedMatch ? parseFloat(sessionEarnedMatch[1]) : 0;
 
   const partyBoost = /party boost active/i.test(text) || /x1\.\d+/i.test(text);
 
-  return {
-    connected,
-    earningRate,
-    nextRewardSec,
-    sessionEarned,
-    partyBoost
-  };
+  return { connected, earningRate, nextRewardSec, sessionEarned, partyBoost };
 }
 
 // ==================== AFK ====================
@@ -201,7 +200,6 @@ async function startAFK() {
   log(`[AFK] Connected: ${afkInfo.connected} | Rate: ${afkInfo.earningRate} c/min | Boost: ${afkInfo.partyBoost}`);
   log('[AFK] ✅ Running 24/7');
 
-  // Keep-alive every 40 seconds
   setInterval(async () => {
     try {
       if (afkPage.isClosed()) {
@@ -213,7 +211,6 @@ async function startAFK() {
       const currentUrl = afkPage.url();
       const title = await afkPage.title().catch(() => 'unknown');
 
-      // Detect bad states
       if (
         title.toLowerCase().includes('just a moment') ||
         title.toLowerCase().includes('verify') ||
@@ -221,40 +218,47 @@ async function startAFK() {
         title.toLowerCase().includes('login') ||
         !currentUrl.includes('/afk')
       ) {
-        log(`[AFK] Bad state detected → "${title}"`);
+        log(`[AFK] Bad state → "${title}"`);
         await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await afkPage.waitForTimeout(5000);
         return;
       }
 
-      // Simulate activity
+      // Activity simulation
       await afkPage.evaluate(() => {
         document.dispatchEvent(new MouseEvent('mousemove', {
           clientX: Math.random() * window.innerWidth,
           clientY: Math.random() * window.innerHeight,
           bubbles: true
         }));
-        window.scrollBy(0, (Math.random() - 0.5) * 60);
+        window.scrollBy(0, (Math.random() - 0.5) * 50);
       });
 
-      // Parse AFK page info
       const state = await getPageState(afkPage);
       const info = parseAFKPage(state.text);
 
+      // Calculate earned since last check
+      let earnedThisRound = 0;
+      if (info.sessionEarned > lastSessionEarned) {
+        earnedThisRound = info.sessionEarned - lastSessionEarned;
+      }
+      lastSessionEarned = info.sessionEarned;
+
+      // Build log line
       let status = `[AFK] `;
-      status += info.connected ? 'Connected' : '⚠ Not Connected';
+      status += info.connected ? 'Connected' : '⚠ Disconnected';
       if (info.earningRate) status += ` | ${info.earningRate} c/min`;
       if (info.partyBoost) status += ` | Boost ON`;
       if (info.nextRewardSec !== null) status += ` | Next: ${info.nextRewardSec}s`;
-      if (info.sessionEarned !== null) status += ` | Session: ${info.sessionEarned >= 0 ? '+' : ''}${info.sessionEarned}`;
+      status += ` | Session: +${info.sessionEarned.toFixed(2)}`;
+      if (earnedThisRound > 0) {
+        status += ` | +${earnedThisRound.toFixed(2)}`;
+      }
 
       log(status);
 
-      // Also try to get total credits (sometimes available)
       const credits = parseCredits(state.text);
-      if (credits >= 0) {
-        logCoinChange(credits);
-      }
+      if (credits >= 0) logCoinChange(credits);
 
     } catch (e) {
       log(`[AFK] Error: ${e.message}`);
@@ -282,6 +286,7 @@ async function checkReward() {
     await page.waitForTimeout(5000);
 
     const state = await getPageState(page);
+
     if (state.title.toLowerCase().includes('login')) {
       log('[REWARD] ❌ NOT LOGGED IN');
       return;
@@ -290,38 +295,44 @@ async function checkReward() {
     const credits = parseCredits(state.text);
     logCoinChange(credits);
 
-    const { ready, timer } = parseRewardCooldown(state.text);
-    log(`[REWARD] Ready: ${ready} | Timer: ${timer || 'none'}`);
+    const rewardInfo = parseRewardInfo(state.text);
+    log(`[REWARD] Available: ${rewardInfo.available} | Timer: ${rewardInfo.timer || 'none'} | Ready: ${rewardInfo.ready}`);
 
-    if (!ready) {
-      log(`[REWARD] ⏳ Cooldown (${timer}), skipping`);
+    if (!rewardInfo.ready) {
+      log(`[REWARD] ⏳ Not ready (Timer: ${rewardInfo.timer}), skipping`);
       return;
     }
 
     const selectors = [
-      'button:has-text("Reward")',
       'button:has-text("Claim")',
+      'button:has-text("Reward")',
       'button:has-text("Collect")',
       'button:has-text("150")',
-      'button:has-text("Daily")'
+      'button:has-text("Daily")',
+      'button:has-text("Get Reward")'
     ];
 
+    let clicked = false;
     for (const sel of selectors) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
         const btnText = (await btn.textContent().catch(() => '')).trim();
         log(`[REWARD] Clicking: "${btnText}"`);
         await btn.click();
-        await page.waitForTimeout(3500);
+        await page.waitForTimeout(4000);
 
         const after = await getPageState(page);
         const afterCredits = parseCredits(after.text);
         if (afterCredits >= 0) logCoinChange(afterCredits);
 
-        log('[REWARD] ✅ Claimed');
+        log('[REWARD] ✅ Claimed successfully');
+        clicked = true;
         break;
       }
     }
+
+    if (!clicked) log('[REWARD] ⚠ No claim button found');
+
   } catch (e) {
     log(`[REWARD] ERROR: ${e.message}`);
   } finally {
@@ -390,7 +401,6 @@ async function checkRenewal() {
         await btn.click();
         await page.waitForTimeout(3000);
 
-        // Confirm
         for (const cs of ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("OK")']) {
           const cb = page.locator(cs).last();
           if (await cb.isVisible().catch(() => false)) {
@@ -428,7 +438,7 @@ async function checkAll() {
 }
 
 async function main() {
-  log('[START] Pingless bot v10');
+  log('[START] Pingless bot v11');
   await initBrowser();
 
   const ok = await startAFK();
