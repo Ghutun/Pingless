@@ -93,7 +93,7 @@ async function blockAds(page) {
 async function getPageState(page) {
   return await page.evaluate(() => ({
     title: document.title,
-    text: document.body?.innerText?.slice(0, 9000) || '',
+    text: document.body?.innerText?.slice(0, 10000) || '',
     url: location.href
   }));
 }
@@ -127,12 +127,9 @@ function parseRewardInfo(text) {
   const available = /your daily reward is available/i.test(text) ||
                     /daily reward is available/i.test(text);
 
-  // Specifically target "Next claim in"
   let timer = null;
   const match = text.match(/next claim in\s*(\d{1,2}:\d{2}:\d{2})/i);
-  if (match) {
-    timer = match[1];
-  }
+  if (match) timer = match[1];
 
   return {
     available,
@@ -164,34 +161,37 @@ function parseServerExpiry(text) {
 }
 
 function parseAFKPage(text) {
-  const connected = /connection status[\s\S]*?connected/i.test(text) || 
-                    (/connected/i.test(text) && !/disconnected/i.test(text));
+  // Strong Connected detection
+  const connected = 
+    /connection\s*status[\s\S]{0,120}?connected/i.test(text) ||
+    (/\bconnected\b/i.test(text) && !/disconnected|not\s+connected|offline/i.test(text));
 
   // Active users
   let activeUsers = null;
-  const usersMatch = text.match(/active users[\s\S]*?(\d+)/i) || 
-                     text.match(/(\d+)\s*active users/i);
+  const usersMatch = text.match(/active\s*users[\s\S]{0,50}?(\d+)/i) ||
+                     text.match(/(\d+)\s*active\s*users/i) ||
+                     text.match(/active\s*users\s*(\d+)/i);
   if (usersMatch) activeUsers = parseInt(usersMatch[1]);
 
-  // Current multiplier (x1.40)
+  // Multiplier
   let multiplier = null;
-  const multiMatch = text.match(/x(\d+\.\d+)/i);
+  const multiMatch = text.match(/x\s*(\d+\.\d+)/i);
   if (multiMatch) multiplier = multiMatch[1];
 
   // Earning rate
   let earningRate = null;
-  const rateMatch = text.match(/([\d.]+)\s*credits?\/min/i);
+  const rateMatch = text.match(/([\d.]+)\s*credits?\s*\/\s*min/i);
   if (rateMatch) earningRate = parseFloat(rateMatch[1]);
 
   // Next reward seconds
   let nextRewardSec = null;
-  const nextMatch = text.match(/next reward[\s\S]*?(\d+)\s*s/i) ||
-                    text.match(/(\d+)\s*s/);
+  const nextMatch = text.match(/next\s*reward[\s\S]{0,80}?(\d+)\s*s/i) ||
+                    text.match(/(\d+)\s*s(?:ec(?:onds)?)?/i);
   if (nextMatch) nextRewardSec = parseInt(nextMatch[1]);
 
   // Session earned
   let sessionEarned = 0;
-  const earnedMatch = text.match(/earned[\s\S]*?([+\-]?[\d.]+)\s*credits?/i);
+  const earnedMatch = text.match(/earned[\s\S]{0,40}?([+\-]?\d+\.?\d*)\s*credits?/i);
   if (earnedMatch) {
     sessionEarned = parseFloat(earnedMatch[1]);
   }
@@ -210,7 +210,7 @@ async function startAFK() {
     timeout: 45000
   });
   log(`[AFK] Status: ${resp ? resp.status() : 'none'}`);
-  await afkPage.waitForTimeout(6000);
+  await afkPage.waitForTimeout(7000);
 
   const state = await getPageState(afkPage);
   log(`[AFK] Title: "${state.title}"`);
@@ -221,7 +221,7 @@ async function startAFK() {
   }
 
   const info = parseAFKPage(state.text);
-  log(`[AFK] Connected: ${info.connected} | ${info.activeUsers || '?'} users | x${info.multiplier || '?'} | ${info.earningRate} c/min`);
+  log(`[AFK] Connected: ${info.connected} | ${info.activeUsers || '?'} users | x${info.multiplier || '?'} | ${info.earningRate || '?'} c/min`);
   log('[AFK] ✅ Running 24/7');
 
   setInterval(async () => {
@@ -244,11 +244,11 @@ async function startAFK() {
       ) {
         log(`[AFK] Bad state → "${title}"`);
         await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await afkPage.waitForTimeout(5000);
+        await afkPage.waitForTimeout(6000);
         return;
       }
 
-      // Activity
+      // Activity simulation
       await afkPage.evaluate(() => {
         document.dispatchEvent(new MouseEvent('mousemove', {
           clientX: Math.random() * window.innerWidth,
@@ -261,6 +261,21 @@ async function startAFK() {
       const state = await getPageState(afkPage);
       const info = parseAFKPage(state.text);
 
+      // Auto recovery if still showing disconnected
+      if (!info.connected) {
+        log('[AFK] Detected Disconnected → forcing hard reload...');
+        try {
+          await afkPage.goto(`https://${HOST}/afk`, {
+            waitUntil: 'networkidle',
+            timeout: 60000
+          });
+          await afkPage.waitForTimeout(8000);
+        } catch (e) {
+          log(`[AFK] Hard reload failed: ${e.message}`);
+        }
+        return;
+      }
+
       // Earned this round
       let earnedThisRound = 0;
       if (info.sessionEarned > lastSessionEarned) {
@@ -268,7 +283,7 @@ async function startAFK() {
       }
       lastSessionEarned = info.sessionEarned;
 
-      // Clean log line
+      // Clean log
       let status = `[AFK] `;
       status += info.connected ? 'Connected' : '⚠ Disconnected';
       if (info.activeUsers) status += ` | ${info.activeUsers} users`;
@@ -287,7 +302,7 @@ async function startAFK() {
       log(`[AFK] Error: ${e.message}`);
       try {
         await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await afkPage.waitForTimeout(5000);
+        await afkPage.waitForTimeout(6000);
         log('[AFK] Recovered');
       } catch (e2) {
         log(`[AFK] Recovery failed: ${e2.message}`);
@@ -457,7 +472,7 @@ async function checkAll() {
 }
 
 async function main() {
-  log('[START] Pingless bot v13');
+  log('[START] Pingless bot v14 (post-maintenance)');
   await initBrowser();
 
   const ok = await startAFK();
