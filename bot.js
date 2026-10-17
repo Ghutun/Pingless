@@ -7,6 +7,9 @@ const SID = 's%3AaQiZM6asrmiAcuxbtOaRTJA4WW7mU4R1.j6CRk%2B9fHfCXRCaZBqRz8dFMHrGG
 const USER_ID = '342814841943228420';
 const HOST = 'dash.pingless.org';
 
+// Restart browser every 2.5 hours to prevent memory issues on Render
+const BROWSER_RESTART_INTERVAL = 2.5 * 60 * 60 * 1000; // 2.5 hours
+
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
@@ -14,26 +17,48 @@ function log(msg) {
 const server = http.createServer((q, s) => s.end('alive'));
 server.listen(PORT, () => log(`[SERVER] listening on ${PORT}`));
 
-let browser, context, afkPage;
+let browser = null;
+let context = null;
+let afkPage = null;
 let lastCredits = -1;
 let lastSessionEarned = 0;
+let browserStartTime = Date.now();
 
 // ==================== BROWSER ====================
 async function initBrowser() {
   log('[BROWSER] Launching...');
+  
+  // Close old browser if exists
+  if (browser) {
+    try {
+      await browser.close();
+    } catch (e) {}
+  }
+
   browser = await chromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--disable-translate',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--no-first-run',
+      '--safebrowsing-disable-auto-update',
       '--disable-blink-features=AutomationControlled'
     ]
   });
 
   context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 768 }
+    viewport: { width: 1280, height: 720 },
+    javaScriptEnabled: true
   });
 
   await context.addInitScript(() => {
@@ -45,6 +70,7 @@ async function initBrowser() {
     { name: 'userId', value: USER_ID, domain: HOST, path: '/', secure: true }
   ]);
 
+  browserStartTime = Date.now();
   log('[BROWSER] Ready');
 }
 
@@ -99,15 +125,16 @@ async function getPageState(page) {
 }
 
 function parseCredits(text) {
+  // Prefer more specific patterns to avoid wrong numbers
   const patterns = [
-    /(?:balance|total|you have|credits?)[:\s]*([\d.]+)/i,
+    /(?:balance|total credits?|you have)[:\s]*([\d.]+)/i,
     /([\d.]+)\s*credits?/i
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match) {
       const val = parseFloat(match[1]);
-      if (!isNaN(val) && val >= 0) return val;
+      if (!isNaN(val) && val >= 0 && val < 100000) return val; // sanity check
     }
   }
   return -1;
@@ -116,7 +143,7 @@ function parseCredits(text) {
 function logCoinChange(current) {
   if (lastCredits >= 0 && current >= 0) {
     const diff = current - lastCredits;
-    if (Math.abs(diff) >= 0.4) {
+    if (Math.abs(diff) >= 0.5 && Math.abs(diff) < 50) { // ignore huge jumps
       log(`[COINS] ${lastCredits.toFixed(2)} → ${current.toFixed(2)} (${diff >= 0 ? '+' : ''}${diff.toFixed(2)})`);
     }
   }
@@ -161,40 +188,30 @@ function parseServerExpiry(text) {
 }
 
 function parseAFKPage(text) {
-  // Strong Connected detection
   const connected = 
     /connection\s*status[\s\S]{0,120}?connected/i.test(text) ||
     (/\bconnected\b/i.test(text) && !/disconnected|not\s+connected|offline/i.test(text));
 
-  // Active users
   let activeUsers = null;
   const usersMatch = text.match(/active\s*users[\s\S]{0,50}?(\d+)/i) ||
-                     text.match(/(\d+)\s*active\s*users/i) ||
-                     text.match(/active\s*users\s*(\d+)/i);
+                     text.match(/(\d+)\s*active\s*users/i);
   if (usersMatch) activeUsers = parseInt(usersMatch[1]);
 
-  // Multiplier
   let multiplier = null;
   const multiMatch = text.match(/x\s*(\d+\.\d+)/i);
   if (multiMatch) multiplier = multiMatch[1];
 
-  // Earning rate
   let earningRate = null;
   const rateMatch = text.match(/([\d.]+)\s*credits?\s*\/\s*min/i);
   if (rateMatch) earningRate = parseFloat(rateMatch[1]);
 
-  // Next reward seconds
   let nextRewardSec = null;
-  const nextMatch = text.match(/next\s*reward[\s\S]{0,80}?(\d+)\s*s/i) ||
-                    text.match(/(\d+)\s*s(?:ec(?:onds)?)?/i);
+  const nextMatch = text.match(/next\s*reward[\s\S]{0,80}?(\d+)\s*s/i);
   if (nextMatch) nextRewardSec = parseInt(nextMatch[1]);
 
-  // Session earned
   let sessionEarned = 0;
   const earnedMatch = text.match(/earned[\s\S]{0,40}?([+\-]?\d+\.?\d*)\s*credits?/i);
-  if (earnedMatch) {
-    sessionEarned = parseFloat(earnedMatch[1]);
-  }
+  if (earnedMatch) sessionEarned = parseFloat(earnedMatch[1]);
 
   return { connected, activeUsers, multiplier, earningRate, nextRewardSec, sessionEarned };
 }
@@ -202,6 +219,11 @@ function parseAFKPage(text) {
 // ==================== AFK ====================
 async function startAFK() {
   log('[AFK] Starting...');
+  
+  if (afkPage) {
+    try { await afkPage.close(); } catch (e) {}
+  }
+
   afkPage = await context.newPage();
   await blockAds(afkPage);
 
@@ -224,94 +246,88 @@ async function startAFK() {
   log(`[AFK] Connected: ${info.connected} | ${info.activeUsers || '?'} users | x${info.multiplier || '?'} | ${info.earningRate || '?'} c/min`);
   log('[AFK] ✅ Running 24/7');
 
-  setInterval(async () => {
-    try {
-      if (afkPage.isClosed()) {
-        log('[AFK] Page closed → recreating...');
-        await startAFK();
-        return;
-      }
-
-      const currentUrl = afkPage.url();
-      const title = await afkPage.title().catch(() => 'unknown');
-
-      if (
-        title.toLowerCase().includes('just a moment') ||
-        title.toLowerCase().includes('verify') ||
-        title.toLowerCase().includes('cloudflare') ||
-        title.toLowerCase().includes('login') ||
-        !currentUrl.includes('/afk')
-      ) {
-        log(`[AFK] Bad state → "${title}"`);
-        await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await afkPage.waitForTimeout(6000);
-        return;
-      }
-
-      // Activity simulation
-      await afkPage.evaluate(() => {
-        document.dispatchEvent(new MouseEvent('mousemove', {
-          clientX: Math.random() * window.innerWidth,
-          clientY: Math.random() * window.innerHeight,
-          bubbles: true
-        }));
-        window.scrollBy(0, (Math.random() - 0.5) * 40);
-      });
-
-      const state = await getPageState(afkPage);
-      const info = parseAFKPage(state.text);
-
-      // Auto recovery if still showing disconnected
-      if (!info.connected) {
-        log('[AFK] Detected Disconnected → forcing hard reload...');
-        try {
-          await afkPage.goto(`https://${HOST}/afk`, {
-            waitUntil: 'networkidle',
-            timeout: 60000
-          });
-          await afkPage.waitForTimeout(8000);
-        } catch (e) {
-          log(`[AFK] Hard reload failed: ${e.message}`);
-        }
-        return;
-      }
-
-      // Earned this round
-      let earnedThisRound = 0;
-      if (info.sessionEarned > lastSessionEarned) {
-        earnedThisRound = +(info.sessionEarned - lastSessionEarned).toFixed(2);
-      }
-      lastSessionEarned = info.sessionEarned;
-
-      // Clean log
-      let status = `[AFK] `;
-      status += info.connected ? 'Connected' : '⚠ Disconnected';
-      if (info.activeUsers) status += ` | ${info.activeUsers} users`;
-      if (info.multiplier) status += ` | x${info.multiplier}`;
-      if (info.earningRate) status += ` | ${info.earningRate} c/min`;
-      if (info.nextRewardSec !== null) status += ` | Next: ${info.nextRewardSec}s`;
-      status += ` | Session: +${info.sessionEarned.toFixed(2)}`;
-      if (earnedThisRound > 0) status += ` | +${earnedThisRound}`;
-
-      log(status);
-
-      const credits = parseCredits(state.text);
-      if (credits >= 0) logCoinChange(credits);
-
-    } catch (e) {
-      log(`[AFK] Error: ${e.message}`);
-      try {
-        await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await afkPage.waitForTimeout(6000);
-        log('[AFK] Recovered');
-      } catch (e2) {
-        log(`[AFK] Recovery failed: ${e2.message}`);
-      }
-    }
-  }, 40 * 1000);
-
   return true;
 }
+
+// AFK keep-alive loop
+setInterval(async () => {
+  try {
+    // Check if we need to restart the whole browser
+    if (Date.now() - browserStartTime > BROWSER_RESTART_INTERVAL) {
+      log('[BROWSER] Scheduled restart to prevent memory issues...');
+      await initBrowser();
+      await startAFK();
+      return;
+    }
+
+    if (!afkPage || afkPage.isClosed()) {
+      log('[AFK] Page closed → recreating...');
+      await startAFK();
+      return;
+    }
+
+    const currentUrl = afkPage.url();
+    const title = await afkPage.title().catch(() => 'unknown');
+
+    if (
+      title.toLowerCase().includes('just a moment') ||
+      title.toLowerCase().includes('verify') ||
+      title.toLowerCase().includes('cloudflare') ||
+      title.toLowerCase().includes('login') ||
+      !currentUrl.includes('/afk')
+    ) {
+      log(`[AFK] Bad state → "${title}"`);
+      await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await afkPage.waitForTimeout(6000);
+      return;
+    }
+
+    // Activity
+    await afkPage.evaluate(() => {
+      document.dispatchEvent(new MouseEvent('mousemove', {
+        clientX: Math.random() * window.innerWidth,
+        clientY: Math.random() * window.innerHeight,
+        bubbles: true
+      }));
+      window.scrollBy(0, (Math.random() - 0.5) * 30);
+    });
+
+    const state = await getPageState(afkPage);
+    const info = parseAFKPage(state.text);
+
+    if (!info.connected) {
+      log('[AFK] Detected Disconnected → forcing reload...');
+      await afkPage.goto(`https://${HOST}/afk`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await afkPage.waitForTimeout(7000);
+      return;
+    }
+
+    let earnedThisRound = 0;
+    if (info.sessionEarned > lastSessionEarned) {
+      earnedThisRound = +(info.sessionEarned - lastSessionEarned).toFixed(2);
+    }
+    lastSessionEarned = info.sessionEarned;
+
+    let status = `[AFK] `;
+    status += info.connected ? 'Connected' : '⚠ Disconnected';
+    if (info.activeUsers) status += ` | ${info.activeUsers} users`;
+    if (info.multiplier) status += ` | x${info.multiplier}`;
+    if (info.earningRate) status += ` | ${info.earningRate} c/min`;
+    if (info.nextRewardSec !== null) status += ` | Next: ${info.nextRewardSec}s`;
+    status += ` | Session: +${info.sessionEarned.toFixed(2)}`;
+    if (earnedThisRound > 0) status += ` | +${earnedThisRound}`;
+
+    log(status);
+
+  } catch (e) {
+    log(`[AFK] Error: ${e.message}`);
+    try {
+      await startAFK();
+    } catch (e2) {
+      log(`[AFK] Recovery failed: ${e2.message}`);
+    }
+  }
+}, 40 * 1000);
 
 // ==================== REWARD ====================
 async function checkReward() {
@@ -346,8 +362,7 @@ async function checkReward() {
       'button:has-text("Reward")',
       'button:has-text("Collect")',
       'button:has-text("150")',
-      'button:has-text("Daily")',
-      'button:has-text("Get Reward")'
+      'button:has-text("Daily")'
     ];
 
     for (const sel of selectors) {
@@ -362,15 +377,14 @@ async function checkReward() {
         const afterCredits = parseCredits(after.text);
         if (afterCredits >= 0) logCoinChange(afterCredits);
 
-        log('[REWARD] ✅ Claimed successfully');
+        log('[REWARD] ✅ Claimed');
         break;
       }
     }
-
   } catch (e) {
     log(`[REWARD] ERROR: ${e.message}`);
   } finally {
-    await page.close();
+    await page.close().catch(() => {});
   }
 }
 
@@ -455,7 +469,7 @@ async function checkRenewal() {
   } catch (e) {
     log(`[RENEW] ERROR: ${e.message}`);
   } finally {
-    await page.close();
+    await page.close().catch(() => {});
   }
 }
 
@@ -472,7 +486,7 @@ async function checkAll() {
 }
 
 async function main() {
-  log('[START] Pingless bot v14 (post-maintenance)');
+  log('[START] Pingless bot v15 (memory-safe)');
   await initBrowser();
 
   const ok = await startAFK();
@@ -488,8 +502,8 @@ async function main() {
 
 main();
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   log('SIGTERM received');
-  if (browser) browser.close().catch(() => {});
+  if (browser) await browser.close().catch(() => {});
   server.close(() => process.exit(0));
 });
