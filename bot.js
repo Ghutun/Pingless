@@ -8,7 +8,7 @@ const USER_ID = '342814841943228420';
 const HOST = 'dash.pingless.org';
 
 // Restart browser every 2.5 hours to prevent memory issues on Render
-const BROWSER_RESTART_INTERVAL = 2.5 * 60 * 60 * 1000; // 2.5 hours
+const BROWSER_RESTART_INTERVAL = 2.5 * 60 * 60 * 1000;
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -28,11 +28,8 @@ let browserStartTime = Date.now();
 async function initBrowser() {
   log('[BROWSER] Launching...');
   
-  // Close old browser if exists
   if (browser) {
-    try {
-      await browser.close();
-    } catch (e) {}
+    try { await browser.close(); } catch (e) {}
   }
 
   browser = await chromium.launch({
@@ -57,8 +54,7 @@ async function initBrowser() {
 
   context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 720 },
-    javaScriptEnabled: true
+    viewport: { width: 1280, height: 720 }
   });
 
   await context.addInitScript(() => {
@@ -125,7 +121,6 @@ async function getPageState(page) {
 }
 
 function parseCredits(text) {
-  // Prefer more specific patterns to avoid wrong numbers
   const patterns = [
     /(?:balance|total credits?|you have)[:\s]*([\d.]+)/i,
     /([\d.]+)\s*credits?/i
@@ -134,7 +129,7 @@ function parseCredits(text) {
     const match = text.match(pattern);
     if (match) {
       const val = parseFloat(match[1]);
-      if (!isNaN(val) && val >= 0 && val < 100000) return val; // sanity check
+      if (!isNaN(val) && val >= 0 && val < 100000) return val;
     }
   }
   return -1;
@@ -143,7 +138,7 @@ function parseCredits(text) {
 function logCoinChange(current) {
   if (lastCredits >= 0 && current >= 0) {
     const diff = current - lastCredits;
-    if (Math.abs(diff) >= 0.5 && Math.abs(diff) < 50) { // ignore huge jumps
+    if (Math.abs(diff) >= 0.5 && Math.abs(diff) < 50) {
       log(`[COINS] ${lastCredits.toFixed(2)} → ${current.toFixed(2)} (${diff >= 0 ? '+' : ''}${diff.toFixed(2)})`);
     }
   }
@@ -166,19 +161,22 @@ function parseRewardInfo(text) {
 }
 
 function parseServerExpiry(text) {
-  const expired = /expired/i.test(text);
+  const expired = /expired/i.test(text) || /has expired/i.test(text);
   let minutesLeft = null;
 
-  const hMinMatch = text.match(/expires?\s+in\s+(\d+)h\s*(\d+)?m?/i);
+  // "expires in 23h 15m" or "23h 15m remaining"
+  const hMinMatch = text.match(/(?:expires?\s+in|remaining)[\s:]*(\d+)\s*h\s*(\d+)?\s*m?/i);
   if (hMinMatch) {
     minutesLeft = parseInt(hMinMatch[1]) * 60 + (hMinMatch[2] ? parseInt(hMinMatch[2]) : 0);
   }
 
-  const minOnlyMatch = text.match(/expires?\s+in\s+(\d+)m/i);
+  // "expires in 45m"
+  const minOnlyMatch = text.match(/(?:expires?\s+in|remaining)[\s:]*(\d+)\s*m/i);
   if (minOnlyMatch && minutesLeft === null) {
     minutesLeft = parseInt(minOnlyMatch[1]);
   }
 
+  // HH:MM:SS format
   const timerMatch = text.match(/(\d{1,2}):(\d{2}):(\d{2})/);
   if (timerMatch && minutesLeft === null) {
     minutesLeft = parseInt(timerMatch[1]) * 60 + parseInt(timerMatch[2]);
@@ -252,7 +250,7 @@ async function startAFK() {
 // AFK keep-alive loop
 setInterval(async () => {
   try {
-    // Check if we need to restart the whole browser
+    // Restart browser every 2.5 hours
     if (Date.now() - browserStartTime > BROWSER_RESTART_INTERVAL) {
       log('[BROWSER] Scheduled restart to prevent memory issues...');
       await initBrowser();
@@ -388,13 +386,14 @@ async function checkReward() {
   }
 }
 
-// ==================== RENEWAL ====================
+// ==================== RENEWAL (≤ 5 hours) ====================
 async function checkRenewal() {
   log('[RENEW] Checking...');
   const page = await context.newPage();
   await blockAds(page);
 
   try {
+    // 1. Check credits
     await page.goto(`https://${HOST}/dashboard`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(5000);
 
@@ -413,8 +412,9 @@ async function checkRenewal() {
       return;
     }
 
+    // 2. Go to server panel
     await page.goto(`https://${HOST}/panel/${SERVER_ID}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(6000);
 
     const panelState = await getPageState(page);
     if (panelState.title.includes('404')) {
@@ -425,22 +425,28 @@ async function checkRenewal() {
     const { expired, minutesLeft } = parseServerExpiry(panelState.text);
     log(`[RENEW] Expired: ${expired} | Minutes left: ${minutesLeft}`);
 
-    const shouldRenew = expired || (minutesLeft !== null && minutesLeft <= 30);
+    // === Renew only when ≤ 5 hours left ===
+    const shouldRenew = expired || (minutesLeft !== null && minutesLeft <= 5 * 60);
+
     if (!shouldRenew) {
-      log(`[RENEW] ⏳ Still active (${minutesLeft}m left)`);
+      const hoursLeft = minutesLeft !== null ? (minutesLeft / 60).toFixed(1) : '?';
+      log(`[RENEW] ⏳ Still has ${hoursLeft}h left (need ≤ 5h). Skipping.`);
       return;
     }
 
-    log('[RENEW] ✅ Renewing...');
+    log('[RENEW] ✅ Time to renew (≤ 5h left)');
 
     const selectors = [
+      'button:has-text("Renew Now")',
       'button:has-text("Renew")',
       'button:has-text("renew")',
+      'a:has-text("Renew Now")',
+      'a:has-text("Renew")',
       'button:has-text("Restore")',
-      'button:has-text("Reactivate")',
-      'a:has-text("Renew")'
+      'button:has-text("Reactivate")'
     ];
 
+    let clicked = false;
     for (const sel of selectors) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
@@ -449,7 +455,8 @@ async function checkRenewal() {
         await btn.click();
         await page.waitForTimeout(3000);
 
-        for (const cs of ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("OK")']) {
+        // Confirm dialog
+        for (const cs of ['button:has-text("Confirm")', 'button:has-text("Yes")', 'button:has-text("OK")', 'button:has-text("Confirm Renew")']) {
           const cb = page.locator(cs).last();
           if (await cb.isVisible().catch(() => false)) {
             await cb.click();
@@ -462,10 +469,16 @@ async function checkRenewal() {
         const afterCredits = parseCredits(after.text);
         if (afterCredits >= 0) logCoinChange(afterCredits);
 
-        log('[RENEW] ✅ Done');
+        log('[RENEW] ✅ Done (-500 credits)');
+        clicked = true;
         break;
       }
     }
+
+    if (!clicked) {
+      log('[RENEW] ⚠ No renew button found');
+    }
+
   } catch (e) {
     log(`[RENEW] ERROR: ${e.message}`);
   } finally {
@@ -486,7 +499,7 @@ async function checkAll() {
 }
 
 async function main() {
-  log('[START] Pingless bot v15 (memory-safe)');
+  log('[START] Pingless bot v16 (renew ≤ 5h)');
   await initBrowser();
 
   const ok = await startAFK();
@@ -497,7 +510,7 @@ async function main() {
   }
 
   await checkAll();
-  setInterval(checkAll, 30 * 60 * 1000);
+  setInterval(checkAll, 30 * 60 * 1000); // every 30 minutes
 }
 
 main();
