@@ -1,7 +1,7 @@
 const http = require('http');
 
 const PORT = process.env.PORT || 10000;
-const SERVER_ID = process.env.PINGLESS_SERVER_ID || '1488944a';
+const SERVER_URL = process.env.PINGLESS_SERVER_URL || 'https://dash.pingless.org/server/manage?id=d3b24764&numeric=7703&mode=server';
 const SID = process.env.PINGLESS_SID || 's%3AaQiZM6asrmiAcuxbtOaRTJA4WW7mU4R1.j6CRk%2B9fHfCXRCaZBqRz8dFMHrGG8TptVv%2FzM69xHP4';
 const USER_ID = process.env.PINGLESS_USER_ID || '342814841943228420';
 const HOST = 'dash.pingless.org';
@@ -127,7 +127,7 @@ async function blockAds(page, strict = true) {
 async function getPageState(page) {
   return await page.evaluate(() => ({
     title: document.title,
-    text: document.body?.innerText?.slice(0, 10000) || '',
+    text: document.body?.innerText?.slice(0, 40000) || '',
     url: location.href
   }));
 }
@@ -149,6 +149,7 @@ async function waitForText(page, regex, timeout = 20000) {
 function parseCredits(text) {
   const num = '([\\d,]+(?:\\.\\d+)?)';
   const patterns = [
+    new RegExp(`${num}\\s*credits?\\b`, 'i'),
     new RegExp(`(?:balance|total credits?|your credits?|credits? balance|you have)[:\\s]*${num}`, 'i'),
     new RegExp(`\\bcredits?[:\\s]+${num}\\b`, 'i'),
     new RegExp(`${num}\\s*credits?\\b`, 'i')
@@ -206,6 +207,9 @@ function parseDuration(str) {
 
 // Looks ONLY at lines related to expiry (and the line right after, since label/value are often split)
 function parseServerExpiry(text) {
+  text = text.replace(/\bO(?=\s*h\b)/g, '0');
+  const direct = text.match(/((?:\d+\s*(?:d|h|m|s)\b\s*)+)\s*remaining/i);
+  const directMins = direct ? parseDuration(direct[1]) : null;
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const durKey = /(expir|remaining|time left|valid for|valid until|ends?\s+(?:in|at)|renews?\s+in)/i;
   const skip = /(daily|claim|reward|afk)/i;
@@ -243,6 +247,11 @@ function parseServerExpiry(text) {
       source = ctx;
       break;
     }
+  }
+
+  if (directMins !== null) {
+    minutesLeft = directMins;
+    source = direct[0].replace(/\s+/g, ' ');
   }
 
   return { expired, minutesLeft, source };
@@ -449,6 +458,8 @@ async function checkReward() {
 // ==================== RENEWAL ====================
 const RENEW_SELECTORS = [
   'button:has-text("Renew Now")',
+  '[role="button"]:has-text("Renew Now")',
+  'text="Renew Now"',
   'button:has-text("Renew")',
   'a:has-text("Renew Now")',
   'a:has-text("Renew")',
@@ -468,7 +479,15 @@ async function readPanelExpiry(page) {
   await waitForText(page, /expir|renew|remaining|time left/i, 20000);
   await page.waitForTimeout(2500); // let countdown widgets render
   const state = await getPageState(page);
-  return { state, ...parseServerExpiry(state.text) };
+  const section = await page.evaluate(() => {
+    let best = '';
+    for (const el of document.querySelectorAll('div,section,aside,main')) {
+      const t = el.innerText || '';
+      if (/server renewal/i.test(t) && /remaining/i.test(t) && (!best || t.length < best.length)) best = t;
+    }
+    return best;
+  }).catch(() => '');
+  return { state, ...parseServerExpiry(section ? section + '\n' + state.text : state.text) };
 }
 
 async function checkRenewal() {
@@ -498,7 +517,7 @@ async function checkRenewal() {
     }
 
     // 2. Server panel
-    await page.goto(`https://${HOST}/panel/${SERVER_ID}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.goto(SERVER_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
     const { state: panelState, expired, minutesLeft, source } = await readPanelExpiry(page);
 
     if (panelState.title.includes('404')) {
