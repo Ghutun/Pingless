@@ -6,7 +6,7 @@ const SID = process.env.PINGLESS_SID || 's%3AaQiZM6asrmiAcuxbtOaRTJA4WW7mU4R1.j6
 const USER_ID = process.env.PINGLESS_USER_ID || '342814841943228420';
 const HOST = 'dash.pingless.org';
 
-const RENEW_THRESHOLD_MIN = 5 * 60;   // renew when <= 5h left
+const RENEW_THRESHOLD_MIN = 60;   // renew when <= 1h left
 const RENEW_COST = 500;
 // If the timer can't be read but a ENABLED renew button exists, renew anyway? (risk: wasting credits)
 const RENEW_IF_UNKNOWN = process.env.RENEW_IF_UNKNOWN === 'true';
@@ -615,7 +615,7 @@ async function checkAll() {
 }
 
 async function main() {
-  log('[START] Pingless bot v17 (renew ≤ 5h, fixed expiry parsing)');
+  log('[START] Pingless bot v17 (renew ≤ 1h)');
   await initBrowser();
 
   const ok = await startAFK();
@@ -626,7 +626,7 @@ async function main() {
   }
 
   await checkAll();
-  setInterval(checkAll, 30 * 60 * 1000);
+  setInterval(checkAll, 15 * 60 * 1000);
 }
 
 if (require.main === module) {
